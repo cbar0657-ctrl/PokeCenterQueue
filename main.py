@@ -158,14 +158,21 @@ def detect_queue(page, store_url: str) -> Tuple[bool, str]:
         "waiting-room",
     ]
 
-    queue_text_indicators = [
-        "you are now in line",
-        "you are in line",
-        "virtual waiting room",
-        "line is paused",
-        "your estimated wait time",
-        "your place in line",
-    ]
+
+queue_text_indicators = [
+    "you're in the virtual queue",
+    "you are in the virtual queue",
+    "virtual queue to enter",
+    "estimated wait time",
+    "you are now in line",
+    "you are in line",
+    "virtual waiting room",
+    "line is paused",
+    "your place in line",
+    "keep this window open to stay in the queue",
+    "you'll automatically be redirected to the site",
+]
+
 
     url_match = any(
         indicator in final_url_lower
@@ -188,8 +195,21 @@ def detect_queue(page, store_url: str) -> Tuple[bool, str]:
             f"HTTP {status}: Access blocked or page unavailable"
         )
 
-    print("✅ No queue detected", flush=True)
-    return False, final_url
+if not text.strip() and not title.strip():
+    raise RuntimeError(
+        "Empty page: unable to determine queue status"
+    )
+
+
+if not text.strip() and not title.strip():
+    raise RuntimeError(
+        "UNKNOWN: HTTP response succeeded, but page "
+        "content was empty. Cannot determine queue status."
+    )
+
+print("✅ No queue detected", flush=True)
+return False, final_url
+
 
 
     indicators = [
