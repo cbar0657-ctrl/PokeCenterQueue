@@ -113,6 +113,7 @@ def send_status_message(text: str):
 
 
 
+
 def detect_queue(page, store_url: str) -> Tuple[bool, str]:
     print(f"🌍 Visiting {store_url}", flush=True)
 
@@ -122,21 +123,13 @@ def detect_queue(page, store_url: str) -> Tuple[bool, str]:
         timeout=45000
     )
 
-    status = None if response is None else response.status
-
-    # Allow time for a possible waiting-room redirect
     page.wait_for_timeout(3000)
 
+    status = None if response is None else response.status
     final_url = page.url
-    final_url_lower = final_url.lower()
-
-    print(
-        f"➡️ Status: {status} | Final URL: {final_url}",
-        flush=True
-    )
 
     try:
-        title = page.title()
+        title = page.title().lower()
     except Exception:
         title = ""
 
@@ -147,68 +140,52 @@ def detect_queue(page, store_url: str) -> Tuple[bool, str]:
     except Exception:
         text = ""
 
-    print(f"📄 Page title: {title}", flush=True)
-    print(f"📄 Page preview: {text[:300]}", flush=True)
+    try:
+        html = page.content().lower()
+    except Exception:
+        html = ""
 
-    # Strong indicators of a waiting room
-    queue_url_indicators = [
-        "queue-it.net",
-        "queue-it.com",
-        "waitingroom",
-        "waiting-room",
+    print(f"HTTP Status: {status}", flush=True)
+    print(f"Page URL: {final_url}", flush=True)
+    print(f"Page title: {title[:150]}", flush=True)
+    print(f"Page text: {text[:300]}", flush=True)
+
+    combined = title + " " + text + " " + html
+
+    queue_phrases = [
+        "you're in the virtual queue",
+        "you are in the virtual queue",
+        "virtual queue to enter",
+        "estimated wait time",
+        "keep this window open to stay in the queue",
+        "you are now in line",
     ]
 
+    captcha_phrases = [
+        "additional security check is required",
+        "hcaptcha",
+        "newassets.hcaptcha.com",
+        "protected and accelerated by imperva",
+        "verify that an actual human",
+    ]
 
-queue_text_indicators = [
-    "you're in the virtual queue",
-    "you are in the virtual queue",
-    "virtual queue to enter",
-    "estimated wait time",
-    "you are now in line",
-    "you are in line",
-    "virtual waiting room",
-    "line is paused",
-    "your place in line",
-    "keep this window open to stay in the queue",
-    "you'll automatically be redirected to the site",
-]
-
-
-    url_match = any(
-        indicator in final_url_lower
-        for indicator in queue_url_indicators
-    )
-
-    text_match = any(
-        indicator in text
-        for indicator in queue_text_indicators
-    )
-
-    if url_match or text_match:
-        print("🚨 Queue detected!", flush=True)
+    if any(word in combined for word in queue_phrases):
+        print("🚨 CONFIRMED QUEUE!", flush=True)
         return True, final_url
 
-    # A forbidden response without queue evidence
-    # must not be interpreted as an inactive queue.
+    if any(word in combined for word in captcha_phrases):
+        print("⚠️ CAPTCHA DETECTED: Possible queue!", flush=True)
+        return "CAPTCHA", final_url
+
     if status is not None and status >= 400:
-        raise RuntimeError(
-            f"HTTP {status}: Access blocked or page unavailable"
-        )
+        raise RuntimeError(f"HTTP {status}: Access blocked")
 
-if not text.strip() and not title.strip():
-    raise RuntimeError(
-        "Empty page: unable to determine queue status"
-    )
+    if not text.strip() and not title.strip():
+        raise RuntimeError("Empty page: Queue status UNKNOWN")
 
+    print("✅ No queue indicators found", flush=True)
+    return False, final_url
 
-if not text.strip() and not title.strip():
-    raise RuntimeError(
-        "UNKNOWN: HTTP response succeeded, but page "
-        "content was empty. Cannot determine queue status."
-    )
-
-print("✅ No queue detected", flush=True)
-return False, final_url
 
 
 
@@ -296,6 +273,24 @@ def main():
                             is_live, final_url = detect_queue(
                                 page, store["url"]
                             )
+
+
+if is_live == "CAPTCHA":
+    print(
+        "⚠️ Possible queue: Imperva CAPTCHA detected",
+        flush=True
+    )
+    # Do not alter the confirmed queue state.
+else:
+    was_live = state["US"]["was_live"]
+
+    if is_live and not was_live:
+        send_discord_alert(store, final_url)
+
+    state["US"]["was_live"] = is_live
+    state["US"]["last_final_url"] = final_url
+    save_state(state)
+
 
                             was_live = state["US"]["was_live"]
 
