@@ -4,7 +4,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, Tuple
-
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import requests
 from playwright.sync_api import sync_playwright
 
@@ -33,17 +34,7 @@ STORES = {
         "name": "Pokémon Center US",
         "flag": "🇺🇸",
         "url": "https://www.pokemoncenter.com/en-us",
-    },
-    "UK": {
-        "name": "Pokémon Center UK",
-        "flag": "🇬🇧",
-        "url": "https://www.pokemoncenter.com/en-gb",
-    },
-    "CA": {
-        "name": "Pokémon Center Canada",
-        "flag": "🇨🇦",
-        "url": "https://www.pokemoncenter.com/en-ca",
-    },
+    }
 }
 
 BROWSER_USER_AGENT = (
@@ -160,62 +151,110 @@ def detect_queue(page, store_url: str) -> Tuple[bool, str]:
     return is_live, final_url
 
 
+
 def main():
     state = load_state()
-
-    print("🚀 Watcher started...", flush=True)
-    print(f"⏱ Checking every {CHECK_INTERVAL_SECONDS} seconds", flush=True)
-
     startup_sent = False
 
-    with sync_playwright() as p:
-        print("🔌 About to connect to Browserless...", flush=True)
+    print("US Pokemon Center Queue Monitor started!", flush=True)
+    print("Schedule: Monday-Friday, 10 AM-4 PM Eastern", flush=True)
+    print("Check interval: 9 minutes", flush=True)
 
-        browser = p.chromium.connect_over_cdp(BROWSERLESS_WS_URL)
+    # Monthly limit on attempted Browserless sessions.
+    # This is NOT a guaranteed unit cap.
+    MONTHLY_CHECK_LIMIT = 850
+    CHECK_INTERVAL = 540
 
-        print("✅ Connected to Browserless", flush=True)
+    current_month = None
+    monthly_checks = 0
 
-        context = browser.new_context(
-            user_agent=BROWSER_USER_AGENT,
-            locale="en-GB",
-            viewport={"width": 1440, "height": 900},
-        )
+    while True:
+        now = datetime.now(ZoneInfo("America/New_York"))
+        month = now.strftime("%Y-%m")
 
-        while True:
-            try:
-                if not startup_sent:
-                    send_status_message("✅ PokeCenter Monitor is online")
-                    startup_sent = True
+        HEARTBEAT_FILE.write_text(str(int(time.time())))
 
-                HEARTBEAT_FILE.write_text(str(int(time.time())))
+        # Reset check counter each month
+        if month != current_month:
+            current_month = month
+            monthly_checks = 0
 
-                for code, store in STORES.items():
-                    page = context.new_page()
+        # Monday-Friday, 10 AM to 4 PM Eastern
+        if now.weekday() >= 5 or not (10 <= now.hour < 16):
+            time.sleep(300)
+            continue
+
+        # Stop checking if monthly limit is reached
+        if monthly_checks >= MONTHLY_CHECK_LIMIT:
+            print("Monthly check limit reached.", flush=True)
+            time.sleep(3600)
+            continue
+
+        monthly_checks += 1
+
+        try:
+            if not startup_sent:
+                send_status_message(
+                    "US Pokemon Center Monitor is online"
+                )
+                startup_sent = True
+
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(
+                    BROWSERLESS_WS_URL
+                )
+
+                try:
+                    context = browser.new_context(
+                        user_agent=BROWSER_USER_AGENT,
+                        locale="en-US",
+                        viewport={"width": 1440, "height": 900},
+                    )
 
                     try:
-                        is_live, final_url = detect_queue(page, store["url"])
-                        was_live = state[code]["was_live"]
+                        store = STORES["US"]
+                        page = context.new_page()
 
-                        print(f"{code}: {is_live}", flush=True)
+                        try:
+                            is_live, final_url = detect_queue(
+                                page, store["url"]
+                            )
 
-                        if is_live and not was_live:
-                            send_discord_alert(store, final_url)
+                            was_live = state["US"]["was_live"]
 
-                        state[code]["was_live"] = is_live
-                        state[code]["last_final_url"] = final_url
+                            print(
+                                f"US Queue Active: {is_live}",
+                                flush=True
+                            )
 
-                    except Exception as e:
-                        print(f"{code} error: {e}", flush=True)
+                            if is_live and not was_live:
+                                send_discord_alert(
+                                    store, final_url
+                                )
+
+                            state["US"]["was_live"] = is_live
+                            state["US"]["last_final_url"] = final_url
+
+                            save_state(state)
+
+                        finally:
+                            page.close()
 
                     finally:
-                        page.close()
+                        context.close()
 
-                save_state(state)
+                finally:
+                    browser.close()
 
-            except Exception as e:
-                print(f"Main loop error: {e}", flush=True)
+        except Exception as e:
+            print(f"Monitor error: {e}", flush=True)
 
-            time.sleep(CHECK_INTERVAL_SECONDS)
+        time.sleep(CHECK_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
+
 
 
 if __name__ == "__main__":
