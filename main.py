@@ -98,6 +98,25 @@ def send_discord_alert(store: Dict[str, str], final_url: str):
         return False
 
 
+def send_captcha_alert(store):
+    payload = {
+        "content": (
+            f"{MENTION_TEXT} ⚠️ **POKÉMON CENTER QUEUE ALERT!**\n"
+            "Imperva CAPTCHA detected. "
+            "A queue may be active!\n"
+            "https://www.pokemoncenter.com/en-us"
+        )
+    }
+
+    try:
+        sent = send_discord_message(payload)
+        if sent:
+            print("📨 CAPTCHA alert sent to Discord!", flush=True)
+        return sent
+    except Exception as exc:
+        print(f"Discord CAPTCHA alert error: {exc}", flush=True)
+        return False
+
 def send_status_message(message: str):
     if not STATUS_WEBHOOK_URL:
         return
@@ -248,13 +267,24 @@ def main():
                                 page, store["url"]
                             )
 
-                            if result == "CAPTCHA":
-                                print(
-                                    "⚠️ CAPTCHA observed; no Discord alert until verified",
-                                    flush=True
-                                )
+                           
+if result == "CAPTCHA":
+    if not state["US"].get("captcha_alerted", False):
+        if send_captcha_alert(store):
+            state["US"]["captcha_alerted"] = True
+            save_state(state)
+    else:
+        print(
+            "CAPTCHA still detected. Alert already sent.",
+            flush=True
+        )
+
                             else:
-                                was_live = state["US"]["was_live"]
+                                else:
+    if result is False:
+        state["US"]["captcha_alerted"] = False
+
+    was_live = state["US"]["was_live"]
 
                                 print(
                                     f"US Queue Active: {result}",
