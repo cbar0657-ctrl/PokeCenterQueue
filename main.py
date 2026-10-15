@@ -112,28 +112,85 @@ def send_status_message(text: str):
         print(f"Status message error: {e}", flush=True)
 
 
+
 def detect_queue(page, store_url: str) -> Tuple[bool, str]:
     print(f"🌍 Visiting {store_url}", flush=True)
 
-    response = page.goto(store_url, wait_until="domcontentloaded", timeout=45000)
+    response = page.goto(
+        store_url,
+        wait_until="domcontentloaded",
+        timeout=45000
+    )
 
     status = None if response is None else response.status
-    final_url = page.url
 
-    print(f"➡️ Status: {status} | Final URL: {final_url}", flush=True)
-
-    if response is not None and response.status >= 400:
-        raise RuntimeError(f"HTTP {response.status} for {store_url}")
-
+    # Allow time for a possible waiting-room redirect
     page.wait_for_timeout(3000)
 
     final_url = page.url
     final_url_lower = final_url.lower()
 
+    print(
+        f"➡️ Status: {status} | Final URL: {final_url}",
+        flush=True
+    )
+
     try:
-        text = page.locator("body").inner_text(timeout=10000).lower()
+        title = page.title()
+    except Exception:
+        title = ""
+
+    try:
+        text = page.locator("body").inner_text(
+            timeout=10000
+        ).lower()
     except Exception:
         text = ""
+
+    print(f"📄 Page title: {title}", flush=True)
+    print(f"📄 Page preview: {text[:300]}", flush=True)
+
+    # Strong indicators of a waiting room
+    queue_url_indicators = [
+        "queue-it.net",
+        "queue-it.com",
+        "waitingroom",
+        "waiting-room",
+    ]
+
+    queue_text_indicators = [
+        "you are now in line",
+        "you are in line",
+        "virtual waiting room",
+        "line is paused",
+        "your estimated wait time",
+        "your place in line",
+    ]
+
+    url_match = any(
+        indicator in final_url_lower
+        for indicator in queue_url_indicators
+    )
+
+    text_match = any(
+        indicator in text
+        for indicator in queue_text_indicators
+    )
+
+    if url_match or text_match:
+        print("🚨 Queue detected!", flush=True)
+        return True, final_url
+
+    # A forbidden response without queue evidence
+    # must not be interpreted as an inactive queue.
+    if status is not None and status >= 400:
+        raise RuntimeError(
+            f"HTTP {status}: Access blocked or page unavailable"
+        )
+
+    print("✅ No queue detected", flush=True)
+    return False, final_url
+
 
     indicators = [
         "queue-it",
