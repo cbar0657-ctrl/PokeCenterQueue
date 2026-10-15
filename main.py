@@ -1,21 +1,21 @@
+
 import json
 import os
 import sys
 import time
-from pathlib import Path
-from typing import Dict, Tuple
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, Tuple, Union
 from zoneinfo import ZoneInfo
+
 import requests
 from playwright.sync_api import sync_playwright
 
-# 🔥 DEBUG START
 print("🔥 BOT STARTING...", flush=True)
 print(f"🐍 Python version: {sys.version}", flush=True)
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 STATUS_WEBHOOK_URL = os.getenv("STATUS_WEBHOOK_URL", "")
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "20"))
 MENTION_TEXT = os.getenv("MENTION_TEXT", "@everyone")
 BROWSERLESS_WS_URL = os.getenv("BROWSERLESS_WS_URL", "")
 
@@ -45,19 +45,19 @@ BROWSER_USER_AGENT = (
 
 
 def load_state():
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
-
-    return {
-        code: {
-            "was_live": False,
-            "last_final_url": None,
-        }
+    default = {
+        code: {"was_live": False, "last_final_url": None}
         for code in STORES
     }
+    if STATE_FILE.exists():
+        try:
+            stored = json.loads(STATE_FILE.read_text())
+            for code in STORES:
+                if isinstance(stored.get(code), dict):
+                    default[code].update(stored[code])
+        except (ValueError, OSError, TypeError, AttributeError):
+            pass
+    return default
 
 
 def save_state(state):
@@ -67,62 +67,58 @@ def save_state(state):
 def send_discord_message(payload: dict):
     if not DISCORD_WEBHOOK_URL:
         print("⚠️ DISCORD_WEBHOOK_URL not set", flush=True)
-        return
-
+        return False
     response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
     response.raise_for_status()
+    return True
 
 
 def send_discord_alert(store: Dict[str, str], final_url: str):
     payload = {
         "content": f"{MENTION_TEXT} 🚨 **QUEUE LIVE** 🚨",
-        "embeds": [
-            {
-                "title": f"{store['flag']} {store['name']} Queue Detected",
-                "url": store["url"],
-                "description": (
-                    "🟢 **Queue is LIVE — act fast!**\n\n"
-                    f"👉 [Open Store]({store['url']})\n"
-                    f"👉 [Join Queue]({final_url})"
-                ),
-                "color": 16711680,
-                "footer": {
-                    "text": "PokeCenter Monitor • Live Alert"
-                },
-            }
-        ],
+        "embeds": [{
+            "title": f"{store['flag']} {store['name']} Queue Detected",
+            "url": store["url"],
+            "description": (
+                "🟢 **Queue is LIVE. Act fast!**\n\n"
+                f"👉 [Open Store]({store['url']})\n"
+                f"👉 [Detected Page]({final_url})"
+            ),
+            "color": 16711680,
+            "footer": {"text": "PokeCenter Monitor • Live Alert"},
+        }],
     }
-
     try:
-        send_discord_message(payload)
-        print(f"📨 Discord alert sent for {store['name']}", flush=True)
-    except Exception as e:
-        print(f"Discord error: {e}", flush=True)
+        sent = send_discord_message(payload)
+        if sent:
+            print(f"📨 Discord alert sent for {store['name']}", flush=True)
+        return sent
+    except Exception as exc:
+        print(f"Discord error: {exc}", flush=True)
+        return False
 
 
-def send_status_message(text: str):
+def send_status_message(message: str):
     if not STATUS_WEBHOOK_URL:
         return
-
-    payload = {"content": text}
     try:
-        response = requests.post(STATUS_WEBHOOK_URL, json=payload, timeout=15)
+        response = requests.post(
+            STATUS_WEBHOOK_URL,
+            json={"content": message},
+            timeout=15
+        )
         response.raise_for_status()
-    except Exception as e:
-        print(f"Status message error: {e}", flush=True)
+    except Exception as exc:
+        print(f"Status message error: {exc}", flush=True)
 
 
-
-
-def detect_queue(page, store_url: str) -> Tuple[bool, str]:
+def detect_queue(page, store_url: str) -> Tuple[Union[bool, str], str]:
     print(f"🌍 Visiting {store_url}", flush=True)
-
     response = page.goto(
         store_url,
         wait_until="domcontentloaded",
         timeout=45000
     )
-
     page.wait_for_timeout(3000)
 
     status = None if response is None else response.status
@@ -134,93 +130,73 @@ def detect_queue(page, store_url: str) -> Tuple[bool, str]:
         title = ""
 
     try:
-        text = page.locator("body").inner_text(
-            timeout=10000
-        ).lower()
+        body = page.locator("body").inner_text(timeout=10000).lower()
     except Exception:
-        text = ""
+        body = ""
 
     try:
         html = page.content().lower()
     except Exception:
         html = ""
 
-    print(f"HTTP Status: {status}", flush=True)
-    print(f"Page URL: {final_url}", flush=True)
-    print(f"Page title: {title[:150]}", flush=True)
-    print(f"Page text: {text[:300]}", flush=True)
+    print(f"➡️ HTTP Status: {status} | Final URL: {final_url}", flush=True)
+    print(f"📄 Page title: {title[:150]}", flush=True)
+    print(f"📄 Page preview: {body[:300]}", flush=True)
 
-    combined = title + " " + text + " " + html
+    combined = " ".join((title, body, html))
 
-    queue_phrases = [
+    queue_phrases = (
         "you're in the virtual queue",
         "you are in the virtual queue",
         "virtual queue to enter",
-        "estimated wait time",
         "keep this window open to stay in the queue",
-        "you are now in line",
-    ]
+        "your place in line",
+    )
 
-    captcha_phrases = [
+    captcha_phrases = (
         "additional security check is required",
-        "hcaptcha",
         "newassets.hcaptcha.com",
         "protected and accelerated by imperva",
         "verify that an actual human",
-    ]
+        "hcaptcha",
+    )
 
-    if any(word in combined for word in queue_phrases):
+    if any(phrase in combined for phrase in queue_phrases):
         print("🚨 CONFIRMED QUEUE!", flush=True)
         return True, final_url
 
-    if any(word in combined for word in captcha_phrases):
-        print("⚠️ CAPTCHA DETECTED: Possible queue!", flush=True)
+    if any(phrase in combined for phrase in captcha_phrases):
+        print(
+            "⚠️ CAPTCHA DETECTED: Possible queue, not confirmed",
+            flush=True
+        )
         return "CAPTCHA", final_url
 
     if status is not None and status >= 400:
-        raise RuntimeError(f"HTTP {status}: Access blocked")
+        raise RuntimeError(
+            f"HTTP {status}: access blocked or page unavailable"
+        )
 
-    if not text.strip() and not title.strip():
-        raise RuntimeError("Empty page: Queue status UNKNOWN")
+    if not title.strip() and not body.strip():
+        raise RuntimeError("Empty page: queue status UNKNOWN")
 
     print("✅ No queue indicators found", flush=True)
     return False, final_url
-
-
-
-
-    indicators = [
-        "queue-it",
-        "waiting room",
-        "virtual queue",
-        "line is paused",
-        "you are now in line",
-        "queue",
-    ]
-
-    is_live = any(x in final_url_lower for x in indicators) or any(
-        x in text for x in indicators
-    )
-
-    return is_live, final_url
-
 
 
 def main():
     state = load_state()
     startup_sent = False
 
-    print("US Pokemon Center Queue Monitor started!", flush=True)
-    print("Schedule: Monday-Friday, 10 AM-4 PM Eastern", flush=True)
-    print("Check interval: 9 minutes", flush=True)
-
-    # Monthly limit on attempted Browserless sessions.
-    # This is NOT a guaranteed unit cap.
-    MONTHLY_CHECK_LIMIT = 850
-    CHECK_INTERVAL = 540
+    check_interval = 540  # 9 minutes
+    monthly_check_limit = 850
 
     current_month = None
     monthly_checks = 0
+
+    print("US Pokemon Center Queue Monitor started!", flush=True)
+    print("Schedule: Monday-Friday, 10 AM-4 PM Eastern", flush=True)
+    print("Check interval: approximately 9 minutes", flush=True)
 
     while True:
         now = datetime.now(ZoneInfo("America/New_York"))
@@ -228,19 +204,16 @@ def main():
 
         HEARTBEAT_FILE.write_text(str(int(time.time())))
 
-        # Reset check counter each month
         if month != current_month:
             current_month = month
             monthly_checks = 0
 
-        # Monday-Friday, 10 AM to 4 PM Eastern
         if now.weekday() >= 5 or not (10 <= now.hour < 16):
             time.sleep(300)
             continue
 
-        # Stop checking if monthly limit is reached
-        if monthly_checks >= MONTHLY_CHECK_LIMIT:
-            print("Monthly check limit reached.", flush=True)
+        if monthly_checks >= monthly_check_limit:
+            print("Monthly attempt limit reached", flush=True)
             time.sleep(3600)
             continue
 
@@ -253,8 +226,8 @@ def main():
                 )
                 startup_sent = True
 
-            with sync_playwright() as p:
-                browser = p.chromium.connect_over_cdp(
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.connect_over_cdp(
                     BROWSERLESS_WS_URL
                 )
 
@@ -266,48 +239,36 @@ def main():
                     )
 
                     try:
-                        store = STORES["US"]
                         page = context.new_page()
 
                         try:
-                            is_live, final_url = detect_queue(
+                            store = STORES["US"]
+
+                            result, final_url = detect_queue(
                                 page, store["url"]
                             )
 
+                            if result == "CAPTCHA":
+                                print(
+                                    "⚠️ CAPTCHA observed; no Discord alert until verified",
+                                    flush=True
+                                )
+                            else:
+                                was_live = state["US"]["was_live"]
 
-if is_live == "CAPTCHA":
-    print(
-        "⚠️ Possible queue: Imperva CAPTCHA detected",
-        flush=True
-    )
-    # Do not alter the confirmed queue state.
-else:
-    was_live = state["US"]["was_live"]
-
-    if is_live and not was_live:
-        send_discord_alert(store, final_url)
-
-    state["US"]["was_live"] = is_live
-    state["US"]["last_final_url"] = final_url
-    save_state(state)
-
-
-                            was_live = state["US"]["was_live"]
-
-                            print(
-                                f"US Queue Active: {is_live}",
-                                flush=True
-                            )
-
-                            if is_live and not was_live:
-                                send_discord_alert(
-                                    store, final_url
+                                print(
+                                    f"US Queue Active: {result}",
+                                    flush=True
                                 )
 
-                            state["US"]["was_live"] = is_live
-                            state["US"]["last_final_url"] = final_url
+                                if result and not was_live:
+                                    if send_discord_alert(store, final_url):
+                                        state["US"]["was_live"] = True
+                                else:
+                                    state["US"]["was_live"] = result
 
-                            save_state(state)
+                                state["US"]["last_final_url"] = final_url
+                                save_state(state)
 
                         finally:
                             page.close()
@@ -318,15 +279,10 @@ else:
                 finally:
                     browser.close()
 
-        except Exception as e:
-            print(f"Monitor error: {e}", flush=True)
+        except Exception as exc:
+            print(f"Monitor error: {exc}", flush=True)
 
-        time.sleep(CHECK_INTERVAL)
-
-
-if __name__ == "__main__":
-    main()
-
+        time.sleep(check_interval)
 
 
 if __name__ == "__main__":
