@@ -88,11 +88,11 @@ def send_alert(kind):
 
 
 def detect_queue(page):
-response = page.goto(
-    STORE_URL,
-    wait_until="commit",
-    timeout=20000,
-)
+    response = page.goto(
+        STORE_URL,
+        wait_until="commit",
+        timeout=20000,
+    )
 
     page.wait_for_timeout(3000)
 
