@@ -182,12 +182,17 @@ def run_check():
 
         try:
             context = browser.new_context(
-                locale="en-US",
-                viewport={
-                    "width": 1440,
-                    "height": 900,
-                },
-            )
+    user_agent=(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    locale="en-US",
+    viewport={
+        "width": 1440,
+        "height": 900,
+    },
+)
 
             try:
                 def filter_resources(route):
