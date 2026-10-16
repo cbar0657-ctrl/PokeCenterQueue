@@ -94,7 +94,7 @@ def detect_queue(page):
         timeout=25000,
     )
 
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(3000)
 
     status = response.status if response else None
     url = page.url.lower()
@@ -202,7 +202,7 @@ def run_check():
                         counts["allowed"] += 1
                         route.continue_()
 
-                context.route("**/*", filter_resources)
+                # context.route("**/*", filter_resources)
 
                 page = context.new_page()
 
