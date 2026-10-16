@@ -10,78 +10,84 @@ from zoneinfo import ZoneInfo
 import requests
 from playwright.sync_api import sync_playwright
 
-print("BOT STARTING", flush=True)
-print(f"Python: {sys.version.split()[0]}", flush=True)
-
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-STATUS_WEBHOOK_URL = os.getenv("STATUS_WEBHOOK_URL", "")
 BROWSERLESS_WS_URL = os.getenv("BROWSERLESS_WS_URL", "")
 MENTION_TEXT = os.getenv("MENTION_TEXT", "@everyone")
 
 STORE_URL = "https://www.pokemoncenter.com/en-us"
 STATE_FILE = Path("state.json")
-TIME_ZONE = ZoneInfo("America/New_York")
+TZ = ZoneInfo("America/New_York")
 
-CHECK_INTERVAL_SECONDS = 540
-MAX_ATTEMPTS_PER_MONTH = 850
+CHECK_INTERVAL = 540
+MONTHLY_ATTEMPT_LIMIT = 850
 
 if not BROWSERLESS_WS_URL:
-    raise RuntimeError("BROWSERLESS_WS_URL missing")
+    raise RuntimeError("BROWSERLESS_WS_URL is missing")
 
 
 def load_state():
-    default = {
-        "captcha_alerted": False,
-        "was_live": False,
-        "month": None,
-        "monthly_attempts": 0,
+    state = {
+        "alerted": False,
+        "month": "",
+        "attempts": 0,
     }
 
     try:
-        stored = json.loads(STATE_FILE.read_text())
+        saved = json.loads(STATE_FILE.read_text())
 
-        if isinstance(stored, dict):
-            if isinstance(stored.get("US"), dict):
-                stored = stored["US"]
-
-            for key in default:
-                if key in stored:
-                    default[key] = stored[key]
+        if isinstance(saved, dict):
+            for key in state:
+                if key in saved:
+                    state[key] = saved[key]
 
     except (OSError, ValueError, TypeError):
         pass
 
-    return default
+    return state
 
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def send_webhook(content):
+def send_alert(kind):
     if not DISCORD_WEBHOOK_URL:
-        print("Discord webhook not configured", flush=True)
+        print("Discord webhook missing", flush=True)
         return False
+
+    if kind == "QUEUE":
+        message = (
+            f"{MENTION_TEXT} "
+            "🚨 **POKÉMON CENTER QUEUE DETECTED**\n"
+            f"{STORE_URL}"
+        )
+
+    else:
+        message = (
+            f"{MENTION_TEXT} "
+            "⚠️ **POKÉMON CENTER SECURITY CHALLENGE**\n"
+            "A visible security-check page was detected. "
+            "Queue is NOT confirmed.\n"
+            f"{STORE_URL}"
+        )
 
     try:
         response = requests.post(
             DISCORD_WEBHOOK_URL,
-            json={"content": content},
+            json={"content": message},
             timeout=10,
         )
         response.raise_for_status()
 
-        print("Discord notification sent", flush=True)
+        print(f"Discord {kind} alert sent", flush=True)
         return True
 
     except requests.RequestException as exc:
-        print(f"Discord send failed: {exc}", flush=True)
+        print(f"Discord delivery failed: {exc}", flush=True)
         return False
 
 
 def detect_queue(page):
-    print(f"Visiting {STORE_URL}", flush=True)
-
     response = page.goto(
         STORE_URL,
         wait_until="domcontentloaded",
@@ -90,34 +96,29 @@ def detect_queue(page):
 
     page.wait_for_timeout(1500)
 
-    status = response.status if response is not None else None
-    url = page.url
+    status = response.status if response else None
+    url = page.url.lower()
 
     try:
-        title = page.title().lower()
+        title = page.title().lower().strip()
     except Exception:
         title = ""
 
     try:
-        text = page.locator("body").inner_text(
+        body = page.locator("body").inner_text(
             timeout=3000
-        ).lower()
+        ).lower().strip()
     except Exception:
-        text = ""
-
-    try:
-        html = page.content().lower()
-    except Exception:
-        html = ""
-
-    combined = " ".join((title, text, html))
+        body = ""
 
     print(
         f"HTTP={status} URL={url} "
-        f"TITLE={title[:75]!r} "
-        f"TEXT={text[:100]!r}",
+        f"TITLE={title[:80]!r} "
+        f"TEXT={body[:160]!r}",
         flush=True,
     )
+
+    visible = title + "\n" + body
 
     queue_phrases = (
         "you're in the virtual queue",
@@ -127,56 +128,51 @@ def detect_queue(page):
         "your place in line",
     )
 
-    captcha_strong = (
+    challenge_phrases = (
         "additional security check is required",
         "protected and accelerated by imperva",
         "verify that an actual human",
     )
 
-    captcha_weak = (
-        "hcaptcha",
-        "newassets.hcaptcha.com",
-    )
-
     if any(
-        phrase in combined
+        phrase in visible
         for phrase in queue_phrases
     ):
-        return "QUEUE", url
+        return "QUEUE"
 
     if any(
-        phrase in combined
-        for phrase in captcha_strong
+        phrase in visible
+        for phrase in challenge_phrases
     ):
-        return "CAPTCHA", url
-
-    if any(
-        phrase in combined
-        for phrase in captcha_weak
-    ):
-        print(
-            "Weak hCaptcha marker found in HTML "
-            "(not necessarily a displayed challenge)",
-            flush=True,
-        )
-        return "CAPTCHA", url
+        return "CHALLENGE"
 
     if status is None or status >= 400:
-        return "UNKNOWN", url
+        return "UNKNOWN"
 
-    if not title.strip() and not text.strip():
-        return "UNKNOWN", url
+    if not title and not body:
+        return "UNKNOWN"
 
-    return "NORMAL", url
+    if (
+        "pokémon center official site" in title
+        or "pokemon center official site" in title
+    ):
+        return "NORMAL"
+
+    print(
+        "Unexpected page content; preserving previous state",
+        flush=True,
+    )
+
+    return "UNKNOWN"
 
 
-def one_check():
-    stats = {
+def run_check():
+    counts = {
         "blocked": 0,
         "allowed": 0,
     }
 
-    started = time.monotonic()
+    start = time.monotonic()
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(
@@ -194,26 +190,24 @@ def one_check():
             )
 
             try:
-                def resource_filter(route):
-                    resource_type = route.request.resource_type
-
-                    if resource_type in (
+                def filter_resources(route):
+                    if route.request.resource_type in (
                         "image",
                         "font",
                         "media",
                     ):
-                        stats["blocked"] += 1
+                        counts["blocked"] += 1
                         route.abort()
                     else:
-                        stats["allowed"] += 1
+                        counts["allowed"] += 1
                         route.continue_()
 
-                context.route("**/*", resource_filter)
+                context.route("**/*", filter_resources)
 
                 page = context.new_page()
 
                 try:
-                    result, url = detect_queue(page)
+                    result = detect_queue(page)
                 finally:
                     page.close()
 
@@ -223,48 +217,39 @@ def one_check():
         finally:
             browser.close()
 
-    elapsed = time.monotonic() - started
-
     print(
-        f"CHECK RESULT={result} "
-        f"duration={elapsed:.1f}s "
-        f"resource_requests_allowed={stats['allowed']} "
-        f"blocked={stats['blocked']}",
+        f"CHECK={result} "
+        f"seconds={time.monotonic()-start:.1f} "
+        f"allowed={counts['allowed']} "
+        f"blocked={counts['blocked']}",
         flush=True,
     )
 
-    print(
-        "Resource counts are NOT Browserless units. "
-        "Compare against Browserless request logs.",
-        flush=True,
-    )
-
-    return result, url
+    return result
 
 
 def main():
     state = load_state()
 
     print(
-        "US Pokemon Center Monitor started",
+        f"Pokémon Center US monitor started; "
+        f"Python {sys.version.split()[0]}",
         flush=True,
     )
+
     print(
-        "Schedule: Monday-Friday 10 AM-4 PM Eastern",
-        flush=True,
-    )
-    print(
-        "Check interval: approximately 9 minutes",
+        "Schedule: Monday-Friday, 10 AM-4 PM ET; "
+        "interval ~9 minutes",
         flush=True,
     )
 
     while True:
-        now = datetime.now(TIME_ZONE)
-        current_month = now.strftime("%Y-%m")
+        now = datetime.now(TZ)
+        month = now.strftime("%Y-%m")
 
-        if state["month"] != current_month:
-            state["month"] = current_month
-            state["monthly_attempts"] = 0
+        if state["month"] != month:
+            state["month"] = month
+            state["attempts"] = 0
             save_state(state)
 
         if now.weekday() >= 5 or not (
@@ -273,95 +258,59 @@ def main():
             time.sleep(300)
             continue
 
-        if (
-            state["monthly_attempts"]
-            >= MAX_ATTEMPTS_PER_MONTH
-        ):
+        if state["attempts"] >= MONTHLY_ATTEMPT_LIMIT:
             print(
-                "Monthly attempt limit reached",
+                "Monthly attempt cap reached; "
+                "checks suspended",
                 flush=True,
             )
             time.sleep(3600)
             continue
 
-        state["monthly_attempts"] += 1
+        state["attempts"] += 1
         save_state(state)
 
         try:
-            result, url = one_check()
+            result = run_check()
 
-            if result == "QUEUE":
-                already_alerted = (
-                    state["was_live"]
-                    or state["captcha_alerted"]
-                )
+            print(f"Detection={result}", flush=True)
 
-                if not already_alerted:
-                    sent = send_webhook(
-                        f"{MENTION_TEXT} "
-                        "🚨 **POKÉMON CENTER QUEUE DETECTED**\n"
-                        f"{STORE_URL}"
-                    )
-
-                    if sent:
-                        state["was_live"] = True
-                else:
-                    state["was_live"] = True
-                    print(
-                        "Queue previously alerted, "
-                        "skipping duplicate",
-                        flush=True,
-                    )
-
-            elif result == "CAPTCHA":
-                already_alerted = (
-                    state["captcha_alerted"]
-                    or state["was_live"]
-                )
-
-                if not already_alerted:
-                    sent = send_webhook(
-                        f"{MENTION_TEXT} "
-                        "⚠️ **POSSIBLE POKÉMON CENTER QUEUE**\n"
-                        "Security challenge indicator detected; "
-                        "not a confirmed queue.\n"
-                        f"{STORE_URL}"
-                    )
-
-                    if sent:
-                        state["captcha_alerted"] = True
+            if result in ("QUEUE", "CHALLENGE"):
+                if not state["alerted"]:
+                    if send_alert(result):
+                        state["alerted"] = True
+                        save_state(state)
                 else:
                     print(
-                        "Challenge previously alerted, "
-                        "skipping duplicate",
+                        "Alert already sent for this event",
                         flush=True,
                     )
 
             elif result == "NORMAL":
-                print(
-                    "Normal storefront: resetting alert state",
-                    flush=True,
-                )
+                if state["alerted"]:
+                    print(
+                        "Normal storefront returned; "
+                        "rearming alert",
+                        flush=True,
+                    )
 
-                state["was_live"] = False
-                state["captcha_alerted"] = False
+                state["alerted"] = False
+                save_state(state)
 
             else:
                 print(
-                    "UNKNOWN result: keeping prior alert state",
+                    "UNKNOWN: no alert; state unchanged",
                     flush=True,
                 )
 
-            save_state(state)
-
         except Exception as exc:
             print(
-                f"CHECK FAILED: "
+                f"CHECK ERROR: "
                 f"{type(exc).__name__}: {exc}",
                 flush=True,
             )
 
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
