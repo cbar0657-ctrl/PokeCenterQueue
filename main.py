@@ -18,8 +18,8 @@ STORE_URL = "https://www.pokemoncenter.com/en-us"
 STATE_FILE = Path("state.json")
 TZ = ZoneInfo("America/New_York")
 
-CHECK_INTERVAL = 540
-MONTHLY_ATTEMPT_LIMIT = 850
+CHECK_INTERVAL = 30
+MONTHLY_ATTEMPT_LIMIT = 25000
 
 if not BROWSERLESS_WS_URL:
     raise RuntimeError("BROWSERLESS_WS_URL is missing")
