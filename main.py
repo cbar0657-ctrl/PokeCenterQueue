@@ -1,4 +1,3 @@
-
 import json
 import os
 import time
@@ -8,7 +7,6 @@ from zoneinfo import ZoneInfo
 
 import requests
 from playwright.sync_api import sync_playwright
-
 
 BROWSERLESS_WS_URL = os.environ["BROWSERLESS_WS_URL"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
@@ -22,26 +20,20 @@ MONTHLY_ATTEMPT_LIMIT = int(
     os.getenv("MONTHLY_ATTEMPT_LIMIT", "25000")
 )
 
-# Monitoring schedule
-# Sleep begins AFTER the browser check finishes.
-
+# Time between checks, AFTER each browser session.
 PEAK_SLEEP_SECONDS = 140
 LATE_SLEEP_SECONDS = 300
 
-# Alert after 3 consecutive unreadable checks.
+# Warn Discord after 3 unreadable checks.
 UNKNOWN_ALERT_THRESHOLD = 3
-
-# Retry a blank page once within the same Browserless session.
-RETRY_BLANK_PAGE = True
-
 
 QUEUE_MARKERS = (
     "you're in the virtual queue",
     "you are in the virtual queue",
     "virtual queue to enter",
     "you are currently in line",
-    "you're in line to enter",
     "you are in line to enter",
+    "you're in line to enter",
     "please wait in line",
     "your estimated wait time",
 )
@@ -83,13 +75,11 @@ def load_state():
         )
 
         if isinstance(saved, dict):
-            state.update({
-                key: saved[key]
-                for key in state
-                if key in saved
-            })
+            for key in state:
+                if key in saved:
+                    state[key] = saved[key]
 
-            # Support the previous alert-state format.
+            # Support previous alert-state format.
             if (
                 "last_signal" not in saved
                 and saved.get("alerted")
@@ -99,10 +89,8 @@ def load_state():
     except (FileNotFoundError, ValueError, OSError):
         pass
 
-    current_month = now_et().strftime("%Y-%m")
-
-    if state["month"] != current_month:
-        state["month"] = current_month
+    if state["month"] != now_et().strftime("%Y-%m"):
+        state["month"] = now_et().strftime("%Y-%m")
         state["attempts"] = 0
 
     return state
@@ -162,23 +150,22 @@ def discord_message(content, mention=False):
         else ""
     )
 
-    allowed_mentions = (
-        {"parse": ["everyone", "users", "roles"]}
-        if mention
-        else {"parse": []}
-    )
-
     response = requests.post(
         DISCORD_WEBHOOK_URL,
         json={
             "content": prefix + content,
-            "allowed_mentions": allowed_mentions,
+            "allowed_mentions": {
+                "parse": (
+                    ["everyone", "users", "roles"]
+                    if mention
+                    else []
+                )
+            },
         },
         timeout=15,
     )
 
     response.raise_for_status()
-
     log("Discord message delivered")
 
 
@@ -191,16 +178,14 @@ def read_page(page):
 
     status = response.status if response else None
 
-    # Wait for actual visible page text instead
-    # of assuming a successful HTTP response
-    # means the page is ready.
-
+    # Wait for visible content rather than relying
+    # only on a successful HTTP response.
     try:
         page.wait_for_function(
-            """() => !!(
+            """() => Boolean(
                 document.body &&
                 document.body.innerText &&
-                document.body.innerText.trim().length > 0
+                document.body.innerText.trim()
             )""",
             timeout=8000,
         )
@@ -232,24 +217,24 @@ def read_page(page):
 
 
 def classify(status, title, body):
-    if status is not None and status >= 400:
+    if status is None or status >= 400:
         return "UNKNOWN"
 
-    # Check queue wording first.
+    # Detect actual queue wording.
     if any(
         marker in body
         for marker in QUEUE_MARKERS
     ):
         return "QUEUE"
 
-    # Then check security challenge wording.
+    # Detect visible security challenge wording.
     if any(
         marker in body
         for marker in CHALLENGE_MARKERS
     ):
         return "CHALLENGE"
 
-    # Blank pages are never treated as normal.
+    # A blank page is NOT a confirmed queue.
     if not body.strip():
         return "UNKNOWN"
 
@@ -259,8 +244,8 @@ def classify(status, title, body):
     ):
         return "UNKNOWN"
 
-    # Require both a familiar title and
-    # recognizable storefront content.
+    # Only classify as normal if the storefront
+    # title AND recognizable content are present.
     if (
         "pokémon center official site" in title
         or "pokemon center official site" in title
@@ -297,17 +282,15 @@ def check_once():
                     body,
                 )
 
-                # Retry only if the page is blank.
-                # Reuse the Browserless session.
-
+                # Retry blank pages once.
+                # Reuse the same Browserless session.
                 if (
-                    RETRY_BLANK_PAGE
-                    and result == "UNKNOWN"
+                    result == "UNKNOWN"
                     and not body.strip()
                 ):
                     log(
                         "Blank page detected; "
-                        "retrying once"
+                        "retrying once in same session"
                     )
 
                     try:
@@ -331,76 +314,70 @@ def check_once():
         finally:
             browser.close()
 
-    elapsed = time.monotonic() - start
-
     log(
         f"CHECK={result} "
-        f"seconds={elapsed:.1f}"
+        f"seconds={time.monotonic() - start:.1f}"
     )
 
     return result
 
 
-def handle_result(result, state):
-    # UNKNOWN means we cannot verify the page.
+def handle_unknown(state):
+    state["unknown_streak"] += 1
 
-    if result == "UNKNOWN":
-        state["unknown_streak"] += 1
+    log(
+        f"UNKNOWN streak={state['unknown_streak']}"
+    )
 
-        log(
-            "UNKNOWN streak="
-            f"{state['unknown_streak']}"
+    if (
+        state["unknown_streak"]
+        >= UNKNOWN_ALERT_THRESHOLD
+        and not state["health_alerted"]
+    ):
+        discord_message(
+            "⚠️ Pokémon Center monitor health warning: "
+            f"{state['unknown_streak']} consecutive checks "
+            "failed to verify the site. "
+            "This is NOT a confirmed queue. "
+            "Check Railway logs."
         )
 
-        if (
-            state["unknown_streak"] >= UNKNOWN_ALERT_THRESHOLD
-            and not state["health_alerted"]
-        ):
-            discord_message(
-                "⚠️ Pokémon Center monitor health warning: "
-                f"{state['unknown_streak']} consecutive checks "
-                "could not verify the page. "
-                "This is NOT a confirmed queue. "
-                "Check Railway logs."
-            )
+        state["health_alerted"] = True
 
-            state["health_alerted"] = True
 
-        # Do not clear a previous queue alert.
+def handle_result(result, state):
+    if result == "UNKNOWN":
+        handle_unknown(state)
         return
 
-    # A readable page means the monitor recovered.
-
+    # Send a recovery notice after readable content returns.
     if state["health_alerted"]:
         try:
             discord_message(
                 "✅ Pokémon Center monitor recovered: "
-                "page is readable again."
+                "site is readable again."
             )
 
             state["health_alerted"] = False
 
         except Exception as exc:
             log(
-                f"Recovery notice failed: {exc}"
+                "Recovery notice failed: "
+                f"{type(exc).__name__}: {exc}"
             )
 
     state["unknown_streak"] = 0
 
-    # Normal storefront resets the signal.
     if result == "NORMAL":
         state["last_signal"] = None
         return
 
-    # Queue and challenge have separate alert states.
-    # A queue can trigger after a challenge.
-
+    # QUEUE and CHALLENGE have separate alert states.
     if state["last_signal"] != result:
         if result == "QUEUE":
             label = (
                 "🚨 POKÉMON CENTER QUEUE DETECTED"
             )
-
         else:
             label = (
                 "⚠️ POKÉMON CENTER SECURITY "
@@ -421,9 +398,9 @@ def handle_result(result, state):
 
 def main():
     log(
-        "Pokémon Center monitor started. "
-        "Weekdays 10 AM–2 PM: 140 seconds; "
-        "2 PM–4 PM: 300 seconds."
+        "Monitor started: weekdays "
+        "10 AM–2 PM = 140s; "
+        "2–4 PM = 300s"
     )
 
     state = load_state()
@@ -431,9 +408,7 @@ def main():
     while True:
         now = now_et()
 
-        interval = monitoring_interval(now)
-
-        if interval is None:
+        if monitoring_interval(now) is None:
             rest = seconds_until_next_open(now)
 
             log(
@@ -444,10 +419,10 @@ def main():
             time.sleep(rest)
             continue
 
-        current_month = now.strftime("%Y-%m")
+        month = now.strftime("%Y-%m")
 
-        if state["month"] != current_month:
-            state["month"] = current_month
+        if state["month"] != month:
+            state["month"] = month
             state["attempts"] = 0
             save_state(state)
 
@@ -482,35 +457,19 @@ def main():
                 f"{type(exc).__name__}: {exc}"
             )
 
-            state["unknown_streak"] += 1
-
-            if (
-                state["unknown_streak"]
-                >= UNKNOWN_ALERT_THRESHOLD
-                and not state["health_alerted"]
-            ):
-                try:
-                    discord_message(
-                        "⚠️ Pokémon Center monitor "
-                        "health warning: "
-                        "repeated checks failed. "
-                        "This is NOT a confirmed queue."
-                    )
-
-                    state["health_alerted"] = True
-
-                except Exception as alert_exc:
-                    log(
-                        "Health notice failed: "
-                        f"{alert_exc}"
-                    )
+            try:
+                handle_unknown(state)
+            except Exception as warning_exc:
+                log(
+                    "Health warning failed: "
+                    f"{type(warning_exc).__name__}: "
+                    f"{warning_exc}"
+                )
 
         finally:
             save_state(state)
 
-        # Determine the interval based on
-        # the current Eastern time.
-
+        # Choose the interval based on Eastern time.
         next_interval = monitoring_interval(
             now_et()
         )
@@ -521,11 +480,9 @@ def main():
                     now_et()
                 )
             )
-
         else:
             time.sleep(next_interval)
 
 
 if __name__ == "__main__":
     main()
-
