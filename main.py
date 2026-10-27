@@ -4,7 +4,6 @@ import signal
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -14,29 +13,24 @@ BROWSERLESS_WS_URL = os.environ["BROWSERLESS_WS_URL"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 MENTION_TEXT = os.getenv("MENTION_TEXT", "@everyone")
 
-# Optional: set to a realistic Chrome UA matching your Browserless Chrome version.
-USER_AGENT = os.getenv("USER_AGENT", "").strip()
-
 STORE_URL = "https://www.pokemoncenter.com/"
-STORE_HOST = "pokemoncenter.com"
 TIME_ZONE = ZoneInfo("America/New_York")
 
-# Point these at a Railway volume (e.g. /data/state.json) to survive redeploys.
+# Point at a Railway volume (e.g. /data/state.json) to survive redeploys.
 STATE_FILE = Path(os.getenv("STATE_PATH", "state.json"))
-STORAGE_FILE = Path(os.getenv("STORAGE_PATH", "storage_state.json"))
 
 MONTHLY_ATTEMPT_LIMIT = int(os.getenv("MONTHLY_ATTEMPT_LIMIT", "25000"))
 
 PEAK_SLEEP_SECONDS = 140
 LATE_SLEEP_SECONDS = 300
 
-# How long to keep polling a page that is still blank/loading.
-READ_WAIT_SECONDS = 25
+# How long to wait for the storefront to appear before deciding.
+READ_WAIT_SECONDS = 20
 
 UNKNOWN_ALERT_THRESHOLD = 3
 
-# Only log full diagnostics for the first N unreadable pages per process run.
-DIAGNOSTIC_LIMIT = 5
+# Full diagnostics for the first N non-normal pages per process run.
+DIAGNOSTIC_LIMIT = 6
 _diag_count = 0
 
 STOP = False
@@ -52,16 +46,23 @@ QUEUE_MARKERS = (
     "your estimated wait time",
 )
 
-CHALLENGE_MARKERS = (
+# Visible text that means a challenge page.
+CHALLENGE_TEXT_MARKERS = (
     "additional security check is required",
     "protected and accelerated by imperva",
     "verify that an actual human",
+    "incapsula incident id",
+    "request unsuccessful",
+    "pardon our interruption",
 )
 
-IMPERVA_HTML_MARKERS = (
+# Raw HTML / iframe URL fragments that mean an Imperva challenge.
+CHALLENGE_HTML_MARKERS = (
     "_incapsula_resource",
     "incapsula incident",
     "/_incapsula_",
+    "imperva",
+    "captcha",
 )
 
 
@@ -112,9 +113,6 @@ def load_state():
             for key in state:
                 if key in saved:
                     state[key] = saved[key]
-
-            if "last_signal" not in saved and saved.get("alerted"):
-                state["last_signal"] = "CHALLENGE"
 
     except (FileNotFoundError, ValueError, OSError):
         pass
@@ -188,40 +186,66 @@ def discord_message(content, mention=False):
 
 # ----------------------------------------------------------- classification
 
-def classify(status, url, title, body):
-    # Challenge/queue wording wins over the HTTP status, because
-    # challenge pages are often served with a 403.
-    if any(marker in body for marker in QUEUE_MARKERS):
+def classify_text(status, title, body):
+    """Classify from visible text only. Returns NORMAL, QUEUE,
+    CHALLENGE, or UNKNOWN (meaning: not decided yet)."""
+    if any(m in body for m in QUEUE_MARKERS):
         return "QUEUE"
 
-    if any(marker in body for marker in CHALLENGE_MARKERS):
+    if any(m in body for m in CHALLENGE_TEXT_MARKERS):
         return "CHALLENGE"
 
-    # Redirected to a third-party queue host. Verify the real queue URL
-    # pattern before relying on this.
-    try:
-        host = (urlparse(url).hostname or "").lower()
-    except ValueError:
-        host = ""
-
-    if host and not host.endswith(STORE_HOST) and "queue" in url.lower():
-        return "QUEUE"
-
-    if status is None or status >= 400:
+    if status is not None and status >= 400:
         return "UNKNOWN"
 
-    # A blank page is NOT a confirmed queue.
-    if not body.strip():
-        return "UNKNOWN"
-
-    if "please enable js and disable any ad blocker" in body:
-        return "UNKNOWN"
-
-    if "pokémon center official site" in title or "pokemon center official site" in title:
+    if (
+        "pokémon center official site" in title
+        or "pokemon center official site" in title
+    ):
         if "trading card game" in body and "search" in body:
             return "NORMAL"
 
     return "UNKNOWN"
+
+
+def collect_evidence(page, response, status):
+    """Look below the visible text for signs of an Imperva challenge.
+    Returns (evidence_list, html)."""
+    evidence = []
+
+    try:
+        html = (page.content() or "")
+    except Exception:
+        html = ""
+
+    html_lower = html.lower()
+
+    for marker in CHALLENGE_HTML_MARKERS:
+        if marker in html_lower:
+            evidence.append(f"html:{marker}")
+
+    # Challenges are often served inside an iframe, so the body is empty.
+    try:
+        for frame in page.frames:
+            frame_url = (frame.url or "").lower()
+            for marker in CHALLENGE_HTML_MARKERS:
+                if marker in frame_url:
+                    evidence.append(f"frame:{marker}")
+    except Exception:
+        pass
+
+    # A 403 only counts when Imperva headers are present.
+    if status == 403 and response is not None:
+        try:
+            headers = response.headers
+            if headers.get("x-iinfo") or "imperva" in (
+                headers.get("x-cdn", "").lower()
+            ):
+                evidence.append("http403+imperva-headers")
+        except Exception:
+            pass
+
+    return evidence, html
 
 
 # ------------------------------------------------------------------ browser
@@ -230,7 +254,6 @@ def read_body(page):
     try:
         return (page.locator("body").inner_text(timeout=2000) or "").lower()
     except Exception:
-        # Navigation in progress (e.g. Imperva reload) or no body yet.
         return ""
 
 
@@ -241,7 +264,7 @@ def read_title(page):
         return ""
 
 
-def log_diagnostics(page, response, status):
+def log_diagnostics(page, response, status, evidence, html):
     global _diag_count
 
     if _diag_count >= DIAGNOSTIC_LIMIT:
@@ -250,30 +273,22 @@ def log_diagnostics(page, response, status):
     _diag_count += 1
 
     try:
-        html = page.content() or ""
-    except Exception as exc:
-        html = ""
-        log(f"DIAG content() failed: {type(exc).__name__}: {exc}")
-
-    try:
         cookie_names = sorted(c["name"] for c in page.context.cookies())
     except Exception:
         cookie_names = []
 
-    imperva = any(m in html.lower() for m in IMPERVA_HTML_MARKERS)
-
-    log(f"DIAG status={status} html_len={len(html)} imperva_in_html={imperva}")
-    log(f"DIAG html_head={html[:400]!r}")
+    log(f"DIAG status={status} html_len={len(html)} evidence={evidence}")
+    log(f"DIAG html_head={html[:500]!r}")
     log(f"DIAG cookies={cookie_names}")
 
     if response is not None:
         try:
-            headers = response.headers
+            h = response.headers
             log(
                 "DIAG headers "
-                f"server={headers.get('server')} "
-                f"x-cdn={headers.get('x-cdn')} "
-                f"x-iinfo={headers.get('x-iinfo')}"
+                f"server={h.get('server')} "
+                f"x-cdn={h.get('x-cdn')} "
+                f"x-iinfo={h.get('x-iinfo')}"
             )
         except Exception:
             pass
@@ -293,12 +308,13 @@ def read_page(page):
     body = ""
     result = "UNKNOWN"
 
-    # Poll until the page produces something we can classify. This rides
-    # out interstitials that set cookies and reload.
+    # Wait for the page to settle into something recognizable.
+    # A brief interstitial that resolves to the storefront becomes
+    # NORMAL here and is not alerted on.
     while True:
         title = read_title(page)
         body = read_body(page)
-        result = classify(status, page.url, title, body)
+        result = classify_text(status, title, body)
 
         if result != "UNKNOWN":
             break
@@ -313,35 +329,17 @@ def read_page(page):
         f"TEXT={body[:250]!r} BODY_CHARS={len(body)}"
     )
 
+    # Never became the storefront. Look for Imperva evidence.
     if result == "UNKNOWN":
-        log_diagnostics(page, response, status)
+        evidence, html = collect_evidence(page, response, status)
+
+        if evidence:
+            result = "CHALLENGE"
+            log(f"Imperva challenge evidence: {evidence}")
+
+        log_diagnostics(page, response, status, evidence, html)
 
     return result
-
-
-def new_context(browser):
-    options = {
-        "locale": "en-US",
-        "timezone_id": "America/New_York",
-        "viewport": {"width": 1366, "height": 768},
-    }
-
-    if USER_AGENT:
-        options["user_agent"] = USER_AGENT
-
-    if STORAGE_FILE.exists():
-        try:
-            return browser.new_context(
-                storage_state=str(STORAGE_FILE),
-                **options,
-            )
-        except Exception as exc:
-            log(
-                "Saved cookies unusable; starting fresh: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-    return browser.new_context(**options)
 
 
 def check_once():
@@ -354,23 +352,13 @@ def check_once():
         )
 
         try:
-            context = new_context(browser)
+            # Fresh context every time: no saved cookies, so the
+            # challenge is not bypassed by a trusted session.
+            context = browser.new_context()
 
             try:
                 page = context.new_page()
                 result = read_page(page)
-
-                # Reuse cookies only after a clean, verified load.
-                if result == "NORMAL":
-                    try:
-                        STORAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
-                        context.storage_state(path=str(STORAGE_FILE))
-                    except Exception as exc:
-                        log(
-                            "Cookie save failed: "
-                            f"{type(exc).__name__}: {exc}"
-                        )
-
             finally:
                 context.close()
 
@@ -385,7 +373,6 @@ def check_once():
 # ----------------------------------------------------------------- handlers
 
 def register_unknown(state):
-    """Update counters only. No network calls, so it cannot fail."""
     state["unknown_streak"] += 1
     log(f"UNKNOWN streak={state['unknown_streak']}")
 
@@ -398,8 +385,8 @@ def maybe_send_health_warning(state):
         discord_message(
             "⚠️ Pokémon Center monitor health warning: "
             f"{state['unknown_streak']} consecutive checks "
-            "failed to verify the site. "
-            "This is NOT a confirmed queue. "
+            "could not read the site and showed no Imperva challenge. "
+            "This is NOT a confirmed challenge or queue. "
             "Check Railway logs."
         )
 
@@ -412,7 +399,6 @@ def handle_result(result, state):
         maybe_send_health_warning(state)
         return
 
-    # Readable content again: send recovery notice if we had warned.
     if state["health_alerted"]:
         try:
             discord_message(
@@ -429,17 +415,13 @@ def handle_result(result, state):
         state["last_signal"] = None
         return
 
-    # QUEUE and CHALLENGE have separate alert states.
-    # If Discord fails here, last_signal stays unchanged, so the
-    # alert is retried on the next cycle.
+    # CHALLENGE (the main signal) or QUEUE. If Discord fails here,
+    # last_signal stays unchanged so the alert retries next cycle.
     if state["last_signal"] != result:
-        if result == "QUEUE":
-            label = "🚨 POKÉMON CENTER QUEUE DETECTED"
+        if result == "CHALLENGE":
+            label = "🚨 POKÉMON CENTER IMPERVA CHECK DETECTED (queue likely)"
         else:
-            label = (
-                "⚠️ POKÉMON CENTER SECURITY CHALLENGE DETECTED "
-                "(not confirmed queue)"
-            )
+            label = "🚨 POKÉMON CENTER QUEUE DETECTED"
 
         discord_message(
             f"{label}\n"
@@ -457,10 +439,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    log(
-        "Monitor started: weekdays "
-        "10 AM-2 PM = 140s; 2-4 PM = 300s"
-    )
+    log("Monitor started: weekdays 10 AM-2 PM = 140s; 2-4 PM = 300s")
 
     state = load_state()
 
@@ -468,14 +447,8 @@ def main():
         now = now_et()
 
         if monitoring_interval(now) is None:
-            # Cap the sleep so DST shifts can't make us wake late.
             rest = min(seconds_until_next_open(now), 1800)
-
-            log(
-                "Outside monitoring hours; "
-                f"sleeping {rest / 60:.1f} minutes"
-            )
-
+            log(f"Outside monitoring hours; sleeping {rest / 60:.1f} minutes")
             sleep_interruptible(rest)
             continue
 
@@ -494,7 +467,6 @@ def main():
         state["attempts"] += 1
         save_state(state)
 
-        # Stage 1: check the site.
         try:
             result = check_once()
         except Exception as exc:
@@ -503,8 +475,6 @@ def main():
 
         log(f"Detection={result} attempt={state['attempts']}")
 
-        # Stage 2: act on the result. A failure here (e.g. Discord)
-        # is logged but never counted as a site failure.
         try:
             handle_result(result, state)
         except Exception as exc:
