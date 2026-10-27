@@ -29,11 +29,21 @@ READ_WAIT_SECONDS = 20
 
 UNKNOWN_ALERT_THRESHOLD = 3
 
+# Consecutive CHALLENGE results required before pinging.
+CHALLENGE_CONFIRMATIONS = 2
+
+# A CHALLENGE only counts if a clean NORMAL storefront was seen this recently.
+BASELINE_MAX_AGE_SECONDS = int(os.getenv("BASELINE_MAX_AGE_SECONDS", "1800"))
+
+# Challenge shells are tiny; the real storefront is hundreds of KB.
+CHALLENGE_MAX_HTML_CHARS = 20000
+
 # Full diagnostics for the first N non-normal pages per process run.
 DIAGNOSTIC_LIMIT = 6
 _diag_count = 0
 
 STOP = False
+LAST_EVIDENCE = []
 
 QUEUE_MARKERS = (
     "you're in the virtual queue",
@@ -56,13 +66,13 @@ CHALLENGE_TEXT_MARKERS = (
     "pardon our interruption",
 )
 
-# Raw HTML / iframe URL fragments that mean an Imperva challenge.
+# Raw HTML fragments that mean an Imperva challenge shell.
+# "captcha" is intentionally NOT here: Browserless injects its own
+# hcaptcha style tag into every page.
 CHALLENGE_HTML_MARKERS = (
     "_incapsula_resource",
     "incapsula incident",
     "/_incapsula_",
-    "imperva",
-    "captcha",
 )
 
 
@@ -100,6 +110,8 @@ def initial_state():
         "last_signal": None,
         "unknown_streak": 0,
         "health_alerted": False,
+        "challenge_streak": 0,
+        "last_normal": None,
     }
 
 
@@ -132,6 +144,20 @@ def save_state(state):
         temporary.replace(STATE_FILE)
     except OSError as exc:
         log(f"State save failed: {type(exc).__name__}: {exc}")
+
+
+def has_recent_baseline(state):
+    last = state.get("last_normal")
+
+    if not last:
+        return False
+
+    try:
+        age = (now_et() - datetime.fromisoformat(last)).total_seconds()
+    except (ValueError, TypeError):
+        return False
+
+    return 0 <= age < BASELINE_MAX_AGE_SECONDS
 
 
 # ----------------------------------------------------------------- schedule
@@ -214,34 +240,33 @@ def collect_evidence(page, response, status):
     evidence = []
 
     try:
-        html = (page.content() or "")
+        html = page.content() or ""
     except Exception:
         html = ""
 
     html_lower = html.lower()
 
-    for marker in CHALLENGE_HTML_MARKERS:
-        if marker in html_lower:
-            evidence.append(f"html:{marker}")
+    # Only trust HTML markers on a small page (a challenge shell).
+    if len(html) < CHALLENGE_MAX_HTML_CHARS:
+        for marker in CHALLENGE_HTML_MARKERS:
+            if marker in html_lower:
+                evidence.append(f"html:{marker}")
 
-    # Challenges are often served inside an iframe, so the body is empty.
+    # Challenge iframes (Imperva resource URLs only).
     try:
         for frame in page.frames:
             frame_url = (frame.url or "").lower()
-            for marker in CHALLENGE_HTML_MARKERS:
-                if marker in frame_url:
-                    evidence.append(f"frame:{marker}")
+            if "_incapsula_" in frame_url:
+                evidence.append("frame:_incapsula_")
+                break
     except Exception:
         pass
 
-    # A 403 only counts when Imperva headers are present.
+    # A 403 only counts when the Imperva header is present.
     if status == 403 and response is not None:
         try:
-            headers = response.headers
-            if headers.get("x-iinfo") or "imperva" in (
-                headers.get("x-cdn", "").lower()
-            ):
-                evidence.append("http403+imperva-headers")
+            if response.headers.get("x-iinfo"):
+                evidence.append("http403+x-iinfo")
         except Exception:
             pass
 
@@ -281,6 +306,11 @@ def log_diagnostics(page, response, status, evidence, html):
     log(f"DIAG html_head={html[:500]!r}")
     log(f"DIAG cookies={cookie_names}")
 
+    try:
+        log(f"DIAG frames={[f.url[:120] for f in page.frames]}")
+    except Exception:
+        pass
+
     if response is not None:
         try:
             h = response.headers
@@ -295,6 +325,9 @@ def log_diagnostics(page, response, status, evidence, html):
 
 
 def read_page(page):
+    global LAST_EVIDENCE
+    LAST_EVIDENCE = []
+
     response = page.goto(
         STORE_URL,
         wait_until="domcontentloaded",
@@ -332,6 +365,7 @@ def read_page(page):
     # Never became the storefront. Look for Imperva evidence.
     if result == "UNKNOWN":
         evidence, html = collect_evidence(page, response, status)
+        LAST_EVIDENCE = evidence
 
         if evidence:
             result = "CHALLENGE"
@@ -385,9 +419,9 @@ def maybe_send_health_warning(state):
         discord_message(
             "⚠️ Pokémon Center monitor health warning: "
             f"{state['unknown_streak']} consecutive checks "
-            "could not read the site and showed no Imperva challenge. "
-            "This is NOT a confirmed challenge or queue. "
-            "Check Railway logs."
+            "could not load the storefront (blank page, or a challenge "
+            "with no recent clean load to compare against). "
+            "This is NOT a confirmed queue. Check Railway logs."
         )
 
         state["health_alerted"] = True
@@ -395,6 +429,16 @@ def maybe_send_health_warning(state):
 
 def handle_result(result, state):
     if result == "UNKNOWN":
+        state["challenge_streak"] = 0
+        register_unknown(state)
+        maybe_send_health_warning(state)
+        return
+
+    # A challenge only means something if this IP recently loaded the
+    # real storefront. Otherwise treat it as a monitor health problem.
+    if result == "CHALLENGE" and not has_recent_baseline(state):
+        log("CHALLENGE ignored: no recent NORMAL baseline")
+        state["challenge_streak"] = 0
         register_unknown(state)
         maybe_send_health_warning(state)
         return
@@ -413,10 +457,21 @@ def handle_result(result, state):
 
     if result == "NORMAL":
         state["last_signal"] = None
+        state["challenge_streak"] = 0
+        state["last_normal"] = now_et().isoformat()
         return
 
-    # CHALLENGE (the main signal) or QUEUE. If Discord fails here,
-    # last_signal stays unchanged so the alert retries next cycle.
+    if result == "CHALLENGE":
+        state["challenge_streak"] += 1
+        log(f"CHALLENGE streak={state['challenge_streak']}")
+
+        if state["challenge_streak"] < CHALLENGE_CONFIRMATIONS:
+            return
+    else:
+        state["challenge_streak"] = 0
+
+    # If Discord fails here, last_signal stays unchanged so the
+    # alert retries on the next cycle.
     if state["last_signal"] != result:
         if result == "CHALLENGE":
             label = "🚨 POKÉMON CENTER IMPERVA CHECK DETECTED (queue likely)"
@@ -426,7 +481,8 @@ def handle_result(result, state):
         discord_message(
             f"{label}\n"
             f"{STORE_URL}\n"
-            f"Detected at {now_et():%Y-%m-%d %I:%M:%S %p} ET",
+            f"Detected at {now_et():%Y-%m-%d %I:%M:%S %p} ET\n"
+            f"Evidence: {LAST_EVIDENCE or 'visible text match'}",
             mention=True,
         )
 
@@ -467,6 +523,7 @@ def main():
         state["attempts"] += 1
         save_state(state)
 
+        # Stage 1: check the site.
         try:
             result = check_once()
         except Exception as exc:
@@ -475,6 +532,8 @@ def main():
 
         log(f"Detection={result} attempt={state['attempts']}")
 
+        # Stage 2: act on the result. A failure here (e.g. Discord)
+        # is logged but never counted as a site failure.
         try:
             handle_result(result, state)
         except Exception as exc:
