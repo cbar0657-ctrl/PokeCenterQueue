@@ -27,9 +27,14 @@ MONTHLY_ATTEMPT_LIMIT = int(os.getenv("MONTHLY_ATTEMPT_LIMIT", "25000"))
 # Set HTTP_PRECHECK=0 to skip the free check and use Browserless only.
 HTTP_PRECHECK = os.getenv("HTTP_PRECHECK", "1") != "0"
 
+# 1 = reuse the browser's default context (keeps Browserless proxy/stealth
+# settings). 0 = create a fresh context each session.
+USE_DEFAULT_CONTEXT = os.getenv("USE_DEFAULT_CONTEXT", "1") != "0"
+
 CHECK_INTERVAL = 30             # loop tick; the free check runs every tick
 BROWSER_ONLY_SECONDS = int(os.getenv("BROWSER_ONLY_SECONDS", "90"))
 ALERTED_RECHECK_SECONDS = 300   # after an alert, slow browser rechecks
+BLIND_RECHECK_SECONDS = 600     # no baseline + repeated unknowns
 HTTP_BLIND_LIMIT = 3            # free check judged blind after this many misses
 
 BROWSER_WAIT_SECONDS = 8        # max time to wait for the page to classify
@@ -43,6 +48,7 @@ CHALLENGE_MAX_HTML_CHARS = 20000
 
 DIAGNOSTIC_LIMIT = 3
 _diag_count = 0
+_ip_logged = False
 
 STOP = False
 LAST_EVIDENCE = []
@@ -343,6 +349,35 @@ def block_heavy(route):
         route.continue_()
 
 
+def log_exit_ip_once(page):
+    """Once per process run: log the exit IP/org and a few browser
+    fingerprint facts, to confirm the proxy is applied to this session."""
+    global _ip_logged
+
+    if _ip_logged:
+        return
+
+    _ip_logged = True
+
+    try:
+        page.goto("https://ipinfo.io/json", timeout=15000)
+        text = page.locator("body").inner_text(timeout=3000)
+        log(f"EXIT-IP {text[:300]!r}")
+    except Exception as exc:
+        log(f"EXIT-IP check failed: {type(exc).__name__}: {exc}")
+
+    try:
+        facts = page.evaluate(
+            "() => ({webdriver: navigator.webdriver, "
+            "ua: navigator.userAgent, "
+            "languages: navigator.languages, "
+            "plugins: navigator.plugins.length})"
+        )
+        log(f"BROWSER-FACTS {facts}")
+    except Exception as exc:
+        log(f"BROWSER-FACTS failed: {type(exc).__name__}: {exc}")
+
+
 def read_page(page):
     global LAST_EVIDENCE, _diag_count
     LAST_EVIDENCE = []
@@ -409,16 +444,39 @@ def browser_check():
         )
 
         try:
-            # Fresh context every time, so a saved session can't hide
-            # the challenge.
-            context = browser.new_context()
+            # Default context keeps any proxy/stealth setup Browserless
+            # applied to it. Otherwise use a fresh context.
+            created_context = False
+
+            if USE_DEFAULT_CONTEXT and browser.contexts:
+                context = browser.contexts[0]
+            else:
+                context = browser.new_context()
+                created_context = True
+
+            page = None
 
             try:
                 page = context.new_page()
                 page.route("**/*", block_heavy)
+
+                log_exit_ip_once(page)
+
                 result = read_page(page)
             finally:
-                context.close()
+                # Close only what we created. A reused default context
+                # stays open; we just close our page.
+                try:
+                    if page is not None:
+                        page.close()
+                except Exception:
+                    pass
+
+                if created_context:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
 
         finally:
             browser.close()
@@ -521,6 +579,15 @@ def browser_interval(state):
     if state["alerted"]:
         return ALERTED_RECHECK_SECONDS
 
+    # Blind and no baseline: sessions can't tell us anything useful.
+    # The free HTTP check still runs every tick and resets this the
+    # moment a clean load happens.
+    if (
+        state["unknown_streak"] >= UNKNOWN_ALERT_THRESHOLD
+        and not has_recent_baseline(state)
+    ):
+        return BLIND_RECHECK_SECONDS
+
     # Mid-confirmation: confirm quickly.
     if state["challenge_streak"] > 0:
         return CHECK_INTERVAL
@@ -541,7 +608,8 @@ def main():
     log(
         "Monitor started: weekdays 10 AM-4 PM ET, "
         f"free check every {CHECK_INTERVAL}s, "
-        f"HTTP_PRECHECK={'on' if HTTP_PRECHECK else 'off'}"
+        f"HTTP_PRECHECK={'on' if HTTP_PRECHECK else 'off'}, "
+        f"USE_DEFAULT_CONTEXT={'on' if USE_DEFAULT_CONTEXT else 'off'}"
     )
     log(f"STORE_URL={STORE_URL}")
 
